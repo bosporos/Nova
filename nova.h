@@ -130,8 +130,6 @@ nova_tid_t __nv_tid_impl__ (void);
 
 /** A thread-local variable guaranteed (post-thread-initialization) to contain
  * the id of the current thread.
- *
- * \note the implementation of this extern is a C++ thread_local (so )
  */
 extern __attribute__ ((visibility ("hidden"))) _Thread_local nova_tid_t nv_tid;
 #else
