@@ -174,17 +174,24 @@ nova_res_t nvmutex_unlock (nova_mutex_t * nv_mutex);
 nova_res_t nvmutex_drop (nova_mutex_t * nv_mutex);
 
 nova_res_t nv_chunk_create (nova_chunk_t ** nv_chunk);
-nova_res_t nv_chunk_release_blocks_to (nova_chunk_t * nv_chunk,
-                                       nova_heap_t * nv_receiver,
-                                       nvi_t nv_begin,
-                                       nvi_t nv_end);
+/* \source regional heap
+ * \target chunk
+ *
+ * \param nova_heap_t* nv_receiver regional heap to move the chunk's blocks to.
+ */
+nova_res_t __nv_chunk_release_blocks_to (nova_chunk_t * nv_chunk,
+                                         nova_heap_t * nv_receiver,
+                                         nvi_t nv_begin,
+                                         nvi_t nv_end);
 /* Destroy a chunk. Invalidates the nv_next pointer of the previous chunk in the chain. */
-nova_res_t nv_chunk_destroy (nova_chunk_t * nv_chunk);
+nova_res_t __nv_chunk_destroy (nova_chunk_t * nv_chunk);
 nova_res_t nv_chunk_destroy_chained (nova_chunk_t * nv_chunk, nvi_t nv_number);
+nova_res_t nv_chunk_bind_to_root (nova_chunk_t * nv_chunk, nova_heap_t * nv_heap);
 
 nova_res_t nv_heap_create (nova_heap_t ** nv_heap);
-nova_res_t nv_heap_destroy (nova_heap_t * nv_heap);
-nova_res_t nv_heap_init (nova_heap_t * nv_heap);
+nova_res_t nv_heap_init (nova_heap_t * nv_heap, nvi_t nv_ln);
+nova_res_t nv_heap_bind_parent (nova_heap_t * nv_child, nova_heap_t * nv_parent);
+
 /** Give an evacuating block to a local heap to be passed up to the regional heap.
  *
  * \source local linkage
@@ -209,6 +216,10 @@ nova_res_t __nv_local_heap_pass_evac_nl_sl (nova_heap_t * nv_heap,
 nova_res_t __nv_local_heap_alloc (nova_heap_t * nv_heap,
                                   void ** nv_obj,
                                   nova_smobjsz_t nv_osz);
+nova_res_t __nv_local_heap_req_block (nova_heap_t * nv_heap,
+                                      nova_smobjsz_t nv_osz,
+                                      nova_block_t ** nv_block);
+
 /** Try to destroy the local heap `nv_heap`.
  * \source client
  * \target local heap
@@ -218,15 +229,25 @@ nova_res_t __nv_local_heap_alloc (nova_heap_t * nv_heap,
  *
  * \param nova_heap_t* nv_heap target
  */
-nova_res_t __nv_local_heap_destroy (nova_heap_t * nv_heap);
+nova_res_t __nv_local_heap_drop (nova_heap_t * nv_heap);
 
-nova_res_t __nv_regional_heap_take_block_nl_sl (nova_heap_t * nv_heap,
-                                                nova_block_t * nv_ev_block);
+nova_res_t __nv_regional_heap_create (nova_heap_t ** nv_heap);
+nova_res_t __nv_root_heap_create (nova_heap_t ** nv_heap);
+nova_res_t __nv_regional_heap_take_evac_block_nl_sl (nova_heap_t * nv_heap,
+                                                     nova_block_t * nv_ev_block);
+nova_res_t __nv_regional_heap_pass_evac_block_nl_sl (nova_heap_t * nv_heap,
+                                                     nova_block_t * nv_block);
 nova_res_t __nv_regional_heap_incref (nova_heap_t * nv_heap);
 nova_res_t __nv_regional_heap_decref (nova_heap_t * nv_heap);
 nova_res_t __nv_regional_heap_drop (nova_heap_t * nv_heap);
+nova_res_t __nv_regional_heap_req_block (nova_heap_t * nv_heap,
+                                         nova_smobjsz_t nv_osz,
+                                         nova_block_t ** nv_block);
 
 nova_res_t nv_lkg_init (nova_lkg_t * nv_lkg);
+nova_res_t nv_lkg_req_block (nova_lkg_t * nv_lkg,
+                             nova_block_t ** nv_block);
+
 /** Drop a local linkage.
  *
  * \source local heap
@@ -256,6 +277,10 @@ nova_res_t __nv_local_lkg_alloc (nova_lkg_t * nv_lkg,
                                  void ** nv_obj,
                                  nova_smobjsz_t nv_osz,
                                  nova_heap_t * nv_heap);
+
+nova_res_t __nv_regional_lkg_drop (nova_lkg_t * nv_lkg);
+nova_res_t __nv_regional_lkg_receive_block_nl_sl (nova_lkg_t * nv_lkg,
+                                                  nova_block_t * nv_block);
 
 nova_res_t nv_block_init (nova_block_t * nv_block, void * nv_block_memory);
 /** Formats nv_block into objects of size `nv_osz`.
@@ -306,25 +331,49 @@ typedef enum nve {
     NVE_BADCFG,
     /* Bad value passed to function.
      * \param const char * description of error
+     * \note this function accepts a printf-style formatstring as the error description;
+     *       parameters should be passed in VLA style after the formatstring.
      */
     NVE_BADVAL,
 
     /* The program has entered a situation in which its behaviour is not defined.
      * That is, something has occurred that should not ever be able to happen.
      * \param const char * description of error.
+     * \note this function accepts a printf-style formatstring as the error description;
+     *       parameters should be passed in VLA style after the formatstring.
      */
     NVE_IMPOSSIBLE,
+
+    /* Client screwed up the heap hierarchy.
+     * \param const char * description of error
+     * \note this function accepts a printf-style formatstring as the error description;
+     *       parameters should be passed in VLA style after the formatstring.
+     */
+    NVE_HIERARCHY,
+
+    /* SECTION: Special */
+
+    /* This error is the effect of some error further down the call tree.
+     * \param const char * description of error
+     * \note this function accepts a printf-style formatstring as the error description;
+     *       parameters should be passed in VLA style after the formatstring.
+     */
+    NVE_CASCADE,
 
     /* SECTION: Concurrency. */
 
     /* A concurrency error was detected.
      * \param const char * description of error
+     * \note this function accepts a printf-style formatstring as the error description;
+     *       parameters should be passed in VLA style after the formatstring.
      */
     NVE_DESYNC,
 
     /* SECTION: System problems. */
 
-    /* Chunk allocation failed: out of memory. */
+    /* Chunk allocation failed: out of memory.
+     * \note for obvious reasons, this error accepts no additional parameters.
+     */
     NVE_CHUNKALLOC_DRY,
 
     /* SECTION: Bad days down at the kernel boundary */
@@ -351,6 +400,8 @@ nova_res_t __nvd_validate_range (void * nv_range_base,
  *            may return values >= 2
  */
 nvi_t __nv_lindex (nvi_t nv_osz);
+
+nvi_t __nv_canonicalize_osz (nvi_t nv_osz);
 
 nova_res_t __nv_cache_reload_from_cfg (uintptr_t nv_override,
                                        nvcfg_t nv_cfg,

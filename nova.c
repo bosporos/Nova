@@ -316,7 +316,7 @@ nova_res_t nv_chunk_create (nova_chunk_t ** nv_chunk)
     return nova_ok;
 }
 
-nova_res_t nv_chunk_release_blocks_to (
+nova_res_t __nv_chunk_release_blocks_to (
     nova_chunk_t * nv_chunk,
     nova_heap_t * nv_receiver,
     nvi_t nv_begin,
@@ -326,13 +326,13 @@ nova_res_t nv_chunk_release_blocks_to (
     nvmutex_lock (&_nv_ulkg->nv_ll);
     for (nvi_t i = nv_begin; i < nv_end; i++) {
         nvmutex_lock (&nv_chunk->nv_blocks[i].nv_fpgm);
-        __nv_ulkg_receive_block_nl_sl (&nv_chunk->nv_blocks[i]);
+        __nv_regional_lkg_receive_block_nl_sl (&nv_receiver->nv_lkgs[0], &nv_chunk->nv_blocks[i]);
     }
     nvmutex_unlock (&_nv_ulkg->nv_ll);
     return nova_ok;
 }
 
-nova_res_t nova_chunk_destroy (nova_chunk_t * nv_chunk)
+nova_res_t __nv_chunk_destroy (nova_chunk_t * nv_chunk)
 {
     free (nv_chunk);
     return nova_ok;
@@ -353,9 +353,17 @@ nova_res_t nv_chunk_destroy_chained (nova_chunk_t * nv_begin, nvi_t nv_number)
             return nova_ok;
         }
         _nv_swap = _nv_chunk->nv_next;
-        nv_chunk_destroy (_nv_chunk);
+        __nv_chunk_destroy (_nv_chunk);
         _nv_chunk = _nv_swap;
     }
+    return nova_ok;
+}
+
+nova_res_t nv_chunk_bind_to_root (nova_chunk_t * nv_chunk, nova_heap_t * nv_heap)
+{
+    nv_chunk->nv_next              = ((nova_chunk_t **)nv_heap)[-2];
+    ((nova_chunk_t **)nv_heap)[-2] = nv_chunk;
+
     return nova_ok;
 }
 
@@ -367,30 +375,32 @@ NOVA_DOCSTUB ();
 
 nova_res_t nv_heap_create (nova_heap_t ** nv_heap)
 {
-    nvi_t _num_lkgs   = nova_read_cfg (NV_SMOBJ_POOLCOUNT);
-    (*nv_heap)        = malloc (sizeof (nova_heap_t *)
+    nvi_t _num_lkgs = nova_read_cfg (NV_SMOBJ_POOLCOUNT);
+    (*nv_heap)      = malloc (sizeof (nova_heap_t *)
                          + sizeof (nvi_t)
                          + (sizeof (nova_lkg_t)
                             * _num_lkgs));
-    (*nv_heap)->nv_ln = _num_lkgs;
     if ((*nv_heap) == NULL) {
         return nova_fail;
     }
-    return nv_heap_init (*nv_heap);
+    return nv_heap_init (*nv_heap, _num_lkgs);
 }
 
-nova_res_t nv_heap_destroy (nova_heap_t * nv_heap)
+nova_res_t nv_heap_init (nova_heap_t * nv_heap, nvi_t nv_ln)
 {
-    free (nv_heap);
-    return nova_ok;
-}
-
-nova_res_t nv_heap_init (nova_heap_t * nv_heap)
-{
+    nv_heap->nv_ln = nv_ln;
     for (nvi_t i = 0; i < nv_heap->nv_ln; i++) {
         nv_lkg_init (&nv_heap->nv_lkgs[i]);
         nv_heap->nv_lkgs[i].nv_heap = nv_heap;
     }
+    nv_heap_bind_parent (nv_heap, NULL);
+    return nova_ok;
+}
+
+nova_res_t nv_heap_bind_parent (nova_heap_t * nv_child, nova_heap_t * nv_parent)
+{
+    nv_child->nv_parent_heap = nv_parent;
+
     return nova_ok;
 }
 
@@ -434,17 +444,70 @@ nova_res_t __nv_local_heap_drop (nova_heap_t * nv_heap)
         nvmutex_unlock (&nv_heap->nv_parent_heap->nv_lkgs[_nv_li].nv_ll);
     }
     nvmutex_unlock (&nv_heap->nv_parent_heap->nv_lkgs[0].nv_ll);
+
+    /* Notify the parent heap of destruction; we know it's a regional, so we just
+     * pass it a decref message.
+     */
+    __nv_regional_heap_decref (nv_heap->nv_parent_heap);
+
     /* Finally, go back to the general case.
      */
-    nv_heap_destroy (nv_heap);
+    free (nv_heap);
     return nova_ok;
 }
 
 nova_res_t __nv_local_heap_pass_evac_nl_sl (nova_heap_t * nv_heap,
                                             nova_block_t * nv_ev_block)
 {
-    __nv_regional_heap_take_block_nl_sl (nv_heap->nv_parent_heap, nv_ev_block);
-    return nova_ok;
+    return __nv_regional_heap_take_evac_block_nl_sl (nv_heap->nv_parent_heap, nv_ev_block);
+}
+
+nova_res_t __nv_local_heap_req_block (nova_heap_t * nv_heap,
+                                      nova_smobjsz_t nv_osz,
+                                      nova_block_t ** nv_block)
+{
+    /* NOTE: we leave it up to the call site to have canonicalized the osz
+     */
+
+    /* Formatting is left to the heap, not to the callsite, because the heap is
+     * the one that actually can see which linkage this block came from.
+     *
+     * We take this measure because formatting non-empty blocks (i.e. any formatting
+     * any block that came from a sized heap) will destroy the free chain, clear
+     * the block's memory, and generally completely invalidate any external
+     * references to it. Which is, y'know, kinda not cool for an allocator to do.
+     */
+
+    if (nova_ok == nv_lkg_req_block (&nv_heap->nv_lkgs[0], nv_block)) {
+        /* It's unsized, so we format it here.
+         */
+        __nv_block_fmt (*nv_block, nv_osz);
+
+        return nova_ok;
+    }
+    /* Don't try to allocate from a sized heap--the appropriately sized heap is
+     * the one requesting the block, after all, so it would be _very_ unproductive
+     * (and also undefined behaviour because the LL mutexes are _not_ reentrant).
+     *
+     * Instead, we go directly to the regional heap (if we have one, which we
+     * really should).
+     */
+    if (__builtin_expect (nv_heap->nv_parent_heap != NULL, 1)) {
+        /* The regional is a bicameral heap just like this one, so it has
+         * jurisdiction on block formatting.
+         */
+        return __nv_regional_heap_req_block (nv_heap->nv_parent_heap,
+                                             nv_osz,
+                                             nv_block);
+    } else {
+#if NOVA_MODE_DEBUG
+        /* In release, this should fail quietly, but we _do_ want to make sure
+         * that it fails loudly in debug mode.
+         */
+        __nv_error (NVE_HIERARCHY, "__nv_local_heap_req_block(%p): orphaned local heap.", nv_heap);
+#endif
+        return nova_fail;
+    }
 }
 
 /*******************************************************************************
@@ -460,18 +523,29 @@ nova_res_t __nv_regional_heap_create (nova_heap_t ** nv_heap)
      * be accessible at their normal places, and we want fast access to the
      * reference count member. The only logical place we can put the refcount,
      * because the heap is a DST, is at a negative offset, then. */
-    (*nv_heap)              = malloc (sizeof (uint64_t)
-                         + sizeof (nova_heap_t *)
-                         + sizeof (nvi_t)
-                         + (sizeof (nova_lkg_t)
-                            * _num_lkgs));
-    *((uint64_t *)*nv_heap) = 0;
-    (*nv_heap)              = &((uint64_t *)*nv_heap)[1];
-    (*nv_heap)->nv_ln       = _num_lkgs;
+    (*nv_heap) = malloc (
+        /* Refcount at heap - 1 */
+        sizeof (uint64_t)
+        /* nova_heap_t */
+        + sizeof (nova_heap_t *)
+        + sizeof (nvi_t)
+        + (sizeof (nova_lkg_t)
+           * _num_lkgs));
+
+    /* Check the malloc result.
+     */
     if ((*nv_heap) == NULL) {
         return nova_fail;
     }
-    return nv_heap_init (*nv_heap);
+
+    /* Set up refcount and skip the pointer to the heap.
+     */
+    *((uint64_t *)*nv_heap) = 0;
+    (*nv_heap)              = (void *)&((uint64_t *)*nv_heap)[1];
+
+    /* Finish up with normal heap initialization.
+     */
+    return nv_heap_init (*nv_heap, _num_lkgs);
 }
 
 nova_res_t __nv_root_heap_create (nova_heap_t ** nv_heap)
@@ -480,45 +554,74 @@ nova_res_t __nv_root_heap_create (nova_heap_t ** nv_heap)
     /* We do a little bit of magic here; we want the heap's normal members to
      * be accessible at their normal places, and we want fast access to the
      * reference count member. The only logical place we can put the refcount,
-     * because the heap is a DST, is at a negative offset, then. */
+     * because the heap is a DST, is at a negative offset, then.
+     * We also need to put in a root chunk list pointer, and we do that here.
+     */
     (*nv_heap) = malloc (
-        /* EXTRA MEMBER: */
+        /* Chunk pointer at heap - 2 */
         sizeof (nova_chunk_t *)
+        /* Refcount at heap - 1 */
         + sizeof (uint64_t)
+        /* nova_heap_t */
         + sizeof (nova_heap_t *)
         + sizeof (nvi_t)
         + (sizeof (nova_lkg_t)
            * _num_lkgs));
-
-    *((nova_chunk_t *)*nv_heap) = NULL;
-    ((uint64_t *)*nv_heap)[1]   = 0;
-    (*nv_heap)                  = &((uint64_t *)*nv_heap)[2];
-    (*nv_heap)->nv_ln           = _num_lkgs;
+    /* Check the malloc result.
+     */
     if ((*nv_heap) == NULL) {
         return nova_fail;
     }
-    return nv_heap_init (*nv_heap);
+
+    /* Set up the chunk list root pointer, 'cuz we're the root heap.
+     */
+    *((nova_chunk_t **)nv_heap) = NULL;
+    /* Set up the reference count variable, and skip the heap pointer past all
+     * this nasty business;
+     * IMPORTANT: assumes 64-bit pointers.
+     */
+    ((uint64_t *)*nv_heap)[1] = 0;
+    (*nv_heap)                = (void *)&((uint64_t *)*nv_heap)[2];
+    /* Perform the normal heap initialization.
+     */
+    return nv_heap_init (*nv_heap, _num_lkgs);
 }
 
 nova_res_t __nv_regional_heap_incref (nova_heap_t * nv_heap)
 {
-    __atomic_add_fetch(&(uint64_t *)nv_heap)[-1], 1, __ATOMIC_ACQ_REL)
+    /* Nice and simple; use fetch_add so as not to create a temporary.
+     */
+    __atomic_add_fetch (&((uint64_t *)nv_heap)[-1], 1, __ATOMIC_ACQ_REL);
 
     return nova_ok;
 }
 
 nova_res_t __nv_regional_heap_decref (nova_heap_t * nv_heap)
 {
-    if (0 == __atomic_sub_fetch (&(uint64_t *)nv_heap)[-1], 1, __ATOMIC_ACQ_REL))
-        {
-            if (nv_heap->nv_parent_heap != NULL) {
-                __nv_regional_heap_drop (nv_heap);
-            } else {
-                /* Root heap persists until explicit destruction, so we just
-                 * ignore this here.
-                 */
-            }
+    /* Basic idea: decrement refcount, and if the decrement zeroes the refcount,
+     * then destroy the heap.
+     *
+     * Slightly more complicated than incrementing the reference, mainly because
+     * there's a special case here: the _root_ heap (which happens is semantically
+     * defined as a regional heap) may only be destroyed explicitly.
+     *
+     * Note the sub_fetch instead of fetch_sub; sub_fetch returns the post-op
+     * value, fetch_sub returns the pre-op value.
+     */
+    if (0 == __atomic_sub_fetch (&((uint64_t *)nv_heap)[-1], 1, __ATOMIC_ACQ_REL)) {
+        /* Check if it's the root heap
+         */
+        if (nv_heap->nv_parent_heap != NULL) {
+            /* If it's just an ordinary regional heap, then drop it.
+             */
+            __nv_regional_heap_drop (nv_heap);
+        } else {
+            /* Root heap persists until explicit destruction, so we just
+             * ignore this here.
+             */
         }
+    }
+
     return nova_ok;
 }
 
@@ -528,10 +631,14 @@ nova_res_t __nv_regional_heap_drop (nova_heap_t * nv_heap)
         nvmutex_lock (&nv_heap->nv_parent_heap->nv_lkgs[0].nv_ll);
         for (nvi_t _nv_li = 0; _nv_li < nv_heap->nv_ln; _nv_li++) {
             nvmutex_lock (&nv_heap->nv_parent_heap->nv_lkgs[_nv_li].nv_ll);
-            __nv_local_lkg_drop (&nv_heap->nv_lkgs[_nv_li]);
+            __nv_regional_lkg_drop (&nv_heap->nv_lkgs[_nv_li]);
             nvmutex_unlock (&nv_heap->nv_parent_heap->nv_lkgs[_nv_li].nv_ll);
         }
         nvmutex_unlock (&nv_heap->nv_parent_heap->nv_lkgs[0].nv_ll);
+
+        /* Notify the parent heap of the drop (before nv_heap is free'd).
+         */
+        __nv_regional_heap_decref (nv_heap->nv_parent_heap);
     } else {
         /* We are the root heap--the root heap persists until explicit destruction,
          * therefore this isn't because of some half-assed reference drop.
@@ -559,16 +666,87 @@ nova_res_t __nv_regional_heap_drop (nova_heap_t * nv_heap)
     return nova_ok;
 }
 
-nova_res_t __nv_regional_heap_take_block_nl_sl (nova_heap_t * nv_heap,
-                                                nova_block_t * nv_ev_block)
+nova_res_t __nv_regional_heap_take_evac_block_nl_sl (nova_heap_t * nv_heap,
+                                                     nova_block_t * nv_ev_block)
 {
+    /* The ULKG LL and appropriate SLKG LL are already locked for this heap.
+     * Theoretically,
+     */
+
     /* If it's empty, then we can go ahead and pass it to the unsized linkage.
      */
     if (0 == __atomic_load_n (&nv_ev_block->nv_acnt, __ATOMIC_ACQUIRE)) {
-        return __nv_ulkg_receive_block_nl_sl (&nv_heap->nv_lkgs[0], nv_ev_block);
+        /* Unsized linkage is always going to be linkage 0.
+         */
+        if (nova_ok
+            == __nv_regional_lkg_receive_block_nl_sl (
+                &nv_heap->nv_lkgs[0],
+                nv_ev_block)) {
+            return nova_ok;
+        }
     } else {
-        return __nv_slkg_receive_block_nl_sl (
-            &nv_heap->nv_lkgs[__nv_lindex (nv_ev_block->nv_osz)]);
+        /* If it's sized, then we just pass it on.
+         * There's porbably a way to funnel the LI up from the dying heap, but
+         * that'd extra complexity n' stuff.
+         */
+        if (nova_ok
+            == __nv_regional_lkg_receive_block_nl_sl (
+                &nv_heap->nv_lkgs[__nv_lindex (nv_ev_block->nv_osz)],
+                nv_ev_block)) {
+            return nova_ok;
+        }
+    }
+
+    __nv_error (
+        NVE_IMPOSSIBLE,
+        "__nv_regional_heap_take_evac_block_nl_sl(%p, %p):"
+        " heap's linkages refused to receive block.");
+
+    return nova_fail;
+}
+
+nova_res_t __nv_regional_heap_req_block (nova_heap_t * nv_heap,
+                                         nova_smobjsz_t nv_osz,
+                                         nova_block_t ** nv_block)
+{
+    if (nova_ok == nv_lkg_req_block (&nv_heap->nv_lkgs[0], nv_block)) {
+        __nv_block_fmt (*nv_block, nv_osz);
+        return nova_ok;
+    }
+
+    if (nova_ok == nv_lkg_req_block (&nv_heap->nv_lkgs[__nv_lindex (nv_osz)], nv_block)) {
+        return nova_ok;
+    }
+
+    if (nv_heap->nv_parent_heap != NULL) {
+        return __nv_regional_heap_req_block (nv_heap->nv_parent_heap,
+                                             nv_osz,
+                                             nv_block);
+    } else {
+        /* Root heap.
+         */
+
+        {
+            nova_chunk_t * _nv_chunk;
+            if (__builtin_expect (nova_ok != nv_chunk_create (&_nv_chunk), 0)) {
+                __nv_error (NVE_CASCADE,
+                            "__nv_regional_heap_req_block(%p, %us, %p):"
+                            " cascading error imminent: chunk allocation failed from"
+                            " root heap");
+                return nova_fail;
+            }
+            __nv_chunk_release_blocks_to (_nv_chunk, nv_heap, 0, 63);
+            /* Take care of the chunk list.
+             */
+            nv_chunk_bind_to_root (_nv_chunk, nv_heap);
+        }
+
+        if (nova_ok == nv_lkg_req_block (&nv_heap->nv_lkgs[0], nv_block)) {
+            __nv_block_fmt (*nv_block, nv_osz);
+            return nova_ok;
+        } else {
+            return nova_fail;
+        }
     }
 }
 
@@ -594,6 +772,60 @@ nova_res_t nv_lkg_init (nova_lkg_t * nv_lkg)
      * and the mutex-init-gone-horribly-awry cases), so we're pretty much safe to
      * return OK in all circumstances. */
     return nova_ok;
+}
+
+nova_res_t nv_lkg_req_block (nova_lkg_t * nv_lkg, nova_block_t ** nv_block)
+{
+    /* A block has been requested from this linkage; we should try to
+     * comply.
+     *
+     * First, lock the LL so we can access the head (nv_head is only __atomic
+     * for local sized heaps), which certainly simplifies a few things.
+     */
+    nvmutex_lock (&nv_lkg->nv_ll);
+
+    /* Check if there are any blocks in the linkage; we just need _one_ block,
+     * so we can just check if the head is NULL.
+     * h(lkg)=nil <=> l(lkg)=0
+     * h(lkg)≠nil <=> l(lkg)≠0, l(S) in |N => l(S)≠0 <=> l(S)>0
+     */
+    if (nv_lkg->nv_head != NULL) {
+        /* Simple singly linked list front-pull & deletion: replace the head of the list
+         * with its right side linkage. We know that nv_head is non-null already,
+         * so we don't need to worry about null pointer dereferencing.
+         */
+        (*nv_block)     = nv_lkg->nv_head;
+        nv_lkg->nv_head = nv_lkg->nv_head->nv_lkgnx;
+        /* We do have to take care of the new head's left side linkage; if it's
+         * not NULl, then we do so.
+         */
+        if (nv_lkg->nv_head != NULL) {
+            nv_lkg->nv_head->nv_lkgpr = NULL;
+        }
+        /* We're clear to unlock here: no remaining changes to nv_head or the
+         * side linkages of any blocks on this chain.
+         *
+         * This is an unsized linkage (i.e. full of empty blocks), therefore
+         * there are no extant deallocating referencers, so it's still safe to
+         * do the lkgnx modification on nv_block after this is unlocked,
+         */
+        nvmutex_unlock (&nv_lkg->nv_ll);
+        /* (*nv_block)->nv_lkgpr == NULL by definition _if this is an unsized
+         * linkage_.
+         */
+        (*nv_block)->nv_lkgnx = NULL;
+
+        /* FPGM is expected to be locked at this ponit
+         */
+        nvmutex_lock (&(*nv_block)->nv_fpgm);
+
+        return nova_ok;
+    }
+
+    /* We failed; unlock and leave.
+     */
+    nvmutex_unlock (&nv_lkg->nv_ll);
+    return nova_fail;
 }
 
 /*******************************************************************************
@@ -718,7 +950,7 @@ nova_res_t __nv_local_lkg_alloc (nova_lkg_t * nv_lkg,
          * add one. benefit: block is guaranteed to have at least one free object.
          */
         if (__builtin_expect (
-                nova_fail == __nv_local_heap_req_block (nv_heap, nv_osz, &_nvc_head),
+                nova_fail == __nv_local_heap_req_block (nv_heap, __nv_canonicalize_osz (nv_osz), &_nvc_head),
                 0)) {
             (*nv_obj) = NULL;
             return nova_fail;
@@ -860,7 +1092,7 @@ nova_res_t __nv_local_lkg_alloc (nova_lkg_t * nv_lkg,
 
     nova_block_t * _nvn;
     if (__builtin_expect (
-            nova_fail == __nv_local_heap_req_block (nv_heap, nv_osz, &_nvn),
+            nova_fail == __nv_local_heap_req_block (nv_heap, __nv_canonicalize_osz (nv_osz), &_nvn),
             0)) {
         (*nv_obj) = NULL;
         return nova_fail;
@@ -892,6 +1124,65 @@ nova_res_t __nv_local_lkg_alloc (nova_lkg_t * nv_lkg,
     /* At this point, there's nothing we can really do.
      */
     return __nv_block_alloc (_nvc_head, nv_obj);
+}
+
+/*******************************************************************************
+ * LINKAGE HANDLING : REGIONAL LINKAGES
+ ******************************************************************************/
+
+nova_res_t __nv_regional_lkg_receive_block_nl_sl (nova_lkg_t * nv_lkg,
+                                                  nova_block_t * nv_block)
+{
+    /* Works for both ULKGs and SLKGs.
+     */
+
+    /* Called from:
+     *  - __nv_regional_heap_take_evac_block_nl_sl (two entry points)
+     *  - __nv_chunk_release_blocks_to
+     * Both of these functions lock the LL before calling this function.
+     */
+    nv_block->nv_lkg   = nv_lkg;
+    nv_block->nv_owner = nv_tid;
+
+    nv_block->nv_lkgnx = nv_lkg->nv_head;
+    nv_block->nv_lkgpr = NULL;
+    if (nv_block->nv_lkgnx != NULL) {
+        nv_block->nv_lkgnx->nv_lkgpr = nv_block;
+    }
+    nv_lkg->nv_head = nv_block;
+
+    /* The FPGM will be locked at this point.
+     */
+    nvmutex_unlock (&nv_block->nv_fpgm);
+
+    return nova_ok;
+}
+
+nova_res_t __nv_regional_lkg_drop (nova_lkg_t * nv_lkg)
+{
+    /* Rather simpler than the local linkage drop function.
+     * For starters, no __atomic head, and the chain only runs in
+     * the one direction, so we can make it single-pass.
+     */
+
+    nvmutex_lock (&nv_lkg->nv_ll);
+
+    nova_block_t *_nv_curr = nv_lkg->nv_head, *_nv_next;
+    nv_lkg->nv_head        = NULL;
+    while (_nv_curr != NULL) {
+        _nv_next = _nv_curr->nv_lkgnx;
+        nvmutex_lock (&_nv_curr->nv_fpgm);
+        _nv_curr->nv_lkgpr = _nv_curr->nv_lkgnx = NULL;
+        __nv_regional_heap_pass_evac_block_nl_sl (nv_lkg->nv_heap, _nv_curr);
+        _nv_curr = _nv_next;
+    }
+
+    nvmutex_unlock (&nv_lkg->nv_ll);
+    /* Mutex end-of-life.
+     */
+    nvmutex_drop (&nv_lkg->nv_ll);
+
+    return nova_ok;
 }
 
 /*******************************************************************************
@@ -1216,7 +1507,7 @@ nova_res_t __nv_block_dealloc (nova_block_t * nv_block, void * nv_obj)
                      * NOTE: nv_block will be passed up with its FPGM locked; that
                      * should be handled on landing.
                      */
-                    __nv_lkg__lal_empty (nv_block);
+                    __nv_lkg_empty (nv_block);
                     goto nv_block_dealloc___secL___;
                 }
             }
@@ -1251,7 +1542,7 @@ nova_res_t __nv_block_dealloc (nova_block_t * nv_block, void * nv_obj)
                  *
                  * Tell the linkage that this block is empty enough.
                  */
-                __nv_lkg__lal_empty_e (nv_block);
+                __nv_lkg_empty_e (nv_block);
                 goto nv_block_dealloc___secL___;
             }
         }
