@@ -1,2 +1,4 @@
 *.o
-nova
+nova_test.dSYM
+nova_test
+nova.dylib

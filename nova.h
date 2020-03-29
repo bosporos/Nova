@@ -6,13 +6,6 @@
 
 /* uint??_t */
 #include <stdint.h>
-/* mmap(void *, size_t, int, int, int, off_t) -> void *
- * munmap (void *, size_t) -> void */
-#include <sys/mman.h>
-#include <stdlib.h>
-/* For indicating errors, debugging, and testing.
- */
-#include <stdio.h>
 /* pthread_mutexattr_init
  * pthread_mutexattr_settype
  * pthread_mutexattr_destroy
@@ -22,12 +15,16 @@
  * pthread_mutex_trylock
  * pthread_mutex_unlock
  * pthread_mutex_destroy
+ *
+ * pthread_mutex_t
  */
 #include <pthread.h>
-/* pthread_mutexattr
+/* size_t
  */
 #include <stddef.h>
-#include <errno.h>
+
+#define NOVA_MODE_DEBUG 1
+#define NOVA_FORCE_NV_TID_DEFPERM 1
 
 /* We want this to be settable from the client; basically, to turn this on or off
  * the library's client should do the following
