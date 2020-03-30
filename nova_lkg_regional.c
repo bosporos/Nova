@@ -16,7 +16,7 @@ nova_res_t __nv_regional_lkg_receive_block_nl_sl (nova_lkg_t * nv_lkg,
      * Both of these functions lock the LL before calling this function.
      */
     nv_block->nv_lkg   = nv_lkg;
-    nv_block->nv_owner = nv_tid;
+    nv_block->nv_owner = __nv_tid ();
 
     nv_block->nv_lkgnx = nv_lkg->nv_head;
     nv_block->nv_lkgpr = NULL;

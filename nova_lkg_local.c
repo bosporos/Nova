@@ -128,7 +128,7 @@ nova_res_t __nv_local_lkg_alloc (nova_lkg_t * nv_lkg,
             return nova_fail;
         }
         /* @MARK block cleanup */
-        _nvc_head->nv_owner = nv_tid;
+        _nvc_head->nv_owner = __nv_tid ();
         _nvc_head->nv_lkgnx = NULL;
         _nvc_head->nv_lkgpr = NULL;
         _nvc_head->nv_lkg   = nv_lkg;
@@ -137,7 +137,6 @@ nova_res_t __nv_local_lkg_alloc (nova_lkg_t * nv_lkg,
          * in a sized chain, we don't accidentally screw up it's deallocation
          * structures.
          */
-        _nvc_head->nv_owner = nv_tid;
 
         /* Set up nv_blfl.
          */
@@ -270,9 +269,8 @@ nova_res_t __nv_local_lkg_alloc (nova_lkg_t * nv_lkg,
         return nova_fail;
     }
 
-    _nvn->nv_owner = nv_tid;
+    _nvn->nv_owner = __nv_tid ();
     _nvn->nv_lkg   = nv_lkg;
-    _nvn->nv_owner = nv_tid;
     /* Again: formatting is handled by __nv_local_heap_req_block. */
 
     __c11_atomic_fetch_or (&_nvn->nv_blfl, NOVA_BLFL_ISHEAD, __ATOMIC_ACQ_REL);

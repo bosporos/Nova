@@ -1,4 +1,6 @@
 #include "nova.h"
+/* malloc */
+#include <stdlib.h>
 
 /*******************************************************************************
  * HEAP HANDLING : REGIONAL HEAPS

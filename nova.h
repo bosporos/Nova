@@ -25,6 +25,8 @@
 
 #define NOVA_MODE_DEBUG 1
 #define NOVA_FORCE_NV_TID_DEFPERM 1
+/* #define NOVA_LAZY_TIDINIT 1 */
+#define NOVA_TID_RECYCLING 1
 
 /* We want this to be settable from the client; basically, to turn this on or off
  * the library's client should do the following
@@ -102,46 +104,6 @@ typedef struct nova_chunk
     struct nova_chunk * nv_next;
     nova_block_t nv_blocks[63];
 } nova_chunk_t;
-
-/** Extracts an ID from the thread from which this function is called.
- * The ID is guaranteed to be unique among the threads composing the process
- * that owns the thread from which this function is called.
- *
- * At the moment, this (critical) function is only supported on darwin-xnu and
- * Linux systems (or anything that has a gettid() that behaves appropriately).
- * To force the use of gettid() on systems that do not define a __linux__ macro,
- * define NOVA_FORCE_GETTID before including nova.h.
- *
- * \return nova_tid_t process-unique thread id.
- */
-nova_tid_t __nv_tid_impl__ (void);
-
-#if !defined(__APPLE__)
-/* Note: on macOS, we encounter a slight problem with using _Thread_local here:
- * destruction order is undefined, and the runtime does _not_ appreciate thread_local
- * variables being used in each other's destructors. Practically, that means that
- * it is a poor idea to use a thread_local cache for deallocation thread-checking
- * on macos, we do not actually use this on OSX. On other systems, we're (more)
- * okay with it.
- */
-
-/** A thread-local variable guaranteed (post-thread-initialization) to contain
- * the id of the current thread.
- */
-extern __attribute__ ((visibility ("hidden"))) _Thread_local nova_tid_t nv_tid;
-#else
-/* On macOS, as we state in the note above, we use the function directly instead
- * of the thread_local variable.
- */
-#    define nv_tid __nv_tid_impl__ ()
-#endif
-
-/* Provides default initialization for nv_tid.
- */
-__attribute__ ((visibility ("hidden"))) nova_res_t nv_tid_init__ ();
-/* Provides default destruction for nv_tid.
- */
-__attribute__ ((visibility ("hidden"))) nova_res_t nv_tid_drop__ ();
 
 /** Initializes `nv_mutex` as a normal, non-reentrant mutex.
  */
@@ -317,6 +279,13 @@ typedef enum nvcfg {
 nvi_t nova_read_cfg (nvcfg_t);
 
 typedef enum nve {
+    /* We're actually ok
+     */
+    NVE_OK = 0,
+    /* Acceptable failure (i.e. nvmutex_trylock).
+     */
+    NVE_FAIL = 1,
+
     /* SECTION: Client screwed up. */
 
     /* Bad value in the configuration.
@@ -332,6 +301,13 @@ typedef enum nve {
      *       parameters should be passed in VLA style after the formatstring.
      */
     NVE_BADVAL,
+    /* Client called a function in a way that contradicts that function's environmental
+     * assumptions.
+     * \param const char * description of error
+     * \note this function accepts a printf-style formatstring as the error description;
+     *       parameters should be passed in VLA style after the formatstring.
+     */
+    NVE_BADCALL,
 
     /* The program has entered a situation in which its behaviour is not defined.
      * That is, something has occurred that should not ever be able to happen.
@@ -373,6 +349,14 @@ typedef enum nve {
      */
     NVE_CHUNKALLOC_DRY,
 
+    /* Structure allocation failed: out of memory.
+     * This occurs when nova is unable to allocate memory for an internal structure.
+     * \param const char * description of error
+     * \note for obvious reasons, this error does not accept printf-style variadic
+     *       arguments.
+     */
+    NVE_STRUCTALLOC_DRY,
+
     /* SECTION: Bad days down at the kernel boundary */
 
     /* This is a right whammy: couldn't get the kernel to give us a thread identifier.
@@ -405,7 +389,8 @@ nova_res_t __nv_cache_reload_from_cfg (uintptr_t nv_override,
                                        uintptr_t * nv_cache);
 extern uintptr_t _nv_dealloc_csize_cache, _nv_dealloc_smobjplsz_cache;
 
-#if (!defined(NOVA_FORCE_NV_TID_DEFPERM) || !NOVA_FORCE_NV_TID_DEFPERM) \
-    && defined(nv_tid)
-#    undef nv_tid
-#endif
+nova_tid_t __nv_tid ();
+nova_res_t __nv_tid_thread_init ();
+nova_res_t __nv_tid_thread_drop ();
+nova_res_t __nv_tid_recycle_init ();
+nova_res_t __nv_tid_recycle_drop ();

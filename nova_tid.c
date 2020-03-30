@@ -1,23 +1,7 @@
 #include "nova.h"
 
-#ifdef __APPLE__
-/* mach_port_name_t
-   kern_return_t? */
-#    include <mach/mach_types.h>
-/* THREAD_IDENTIFIER_INFO_COUNT
-   thread_identifier_info_data_t
-   THREAD_IDENTIFIER_INFO */
-#    include <mach/thread_info.h>
-/* thread_info(thread_act_t = mach_port_name_t,
-               thread_flavor_t,
-               thread_info_t,
-               mach_msg_type_number_t) */
-#    include <mach/mach.h>
-#endif
-#ifdef __linux__
-/* gettid(void) */
-#    include <sys/types.h>
-#endif
+/* malloc, free */
+#include <stdlib.h>
 
 /*******************************************************************************
  * TID HANDLING
@@ -25,126 +9,155 @@
 
 NOVA_DOCSTUB ();
 
-nova_tid_t __nv_tid_impl__ ()
+#if !defined(NOVA_TID_RECYCLING)
+static /* __atomic */ nova_tid_t __nv_tid_next = 1;
+#endif
+static _Thread_local nova_tid_t __nv_tid_local = 0;
+
+nova_tid_t __nv_tid ()
 {
-    /* okay, so this is gonna be kinda complicated.
-     */
-#ifdef __APPLE__
-    /* Big thanks to https://stackoverflow.com/questions/1540603/mac-iphone-is-there-a-way-to-get-a-thread-identifier-without-using-objective-c */
-
-    /*
-     * On macos, there are a few options:
-     *  pthread_self()
-     *  pthread_threadid_np(pthread_t, uint64_t **)
-     *  pthread_mach_thread_np(pthread_t) -> mach_port_name_t
-     *  thread_info(mach_port_name_t, ...)
-     *
-     * pthread_self() returns a pthread_t, which, on darwin-xnu, is actually
-     * a pointer to a _opaque_pthread_t structure which is 8176 + 16 bytes in
-     * size on LP64.
-     *      The pthread_t will be unique for existing pthreads in a process, but
-     * it's just a blindly allocated pointer (_pthread_allocate calls mach_vm_map
-     * or mach_vm_allocate), so it can't be relied on to be a process-unique ID,
-     * as recycling is a function of the OS re-using the mapped memory.
-     *
-     * pthread_threadid_np calls the threadid_self syscall, which I can't really
-     * find information on, so I can't really make assumptions about its behaviour.
-     *
-     * pthread_mach_thread_np(pthread_t) returns a mach_port_name_t, which would
-     * seem to be unique to a process, _but_ it will return different values for
-     * the same thread when called from different processes.
-     *
-     * However, the mach_port_name_t returned by pthread_mach_thread_np can be
-     * passed to thread_info () with flavor=THREAD_IDENTIFIER_INFO, an obscure
-     * XNU kernel call.
-     */
-
-    /* little trick from pthread/mach_dep.h */
-#    if defined(__i386__) || defined(__x86_64__)
-    void * _nv_pself;
-    asm volatile("mov %%gs:%P1, %0"
-                 : "=r"(_nv_pself)
-#        ifdef __LP64__
-                 : "i"(0 * sizeof (void *) + 0x60));
-#        else
-                 : "i"(0 * sizeof(void*) + 0x48)
-#        endif
-
-    mach_port_name_t _nv_mach_port = pthread_mach_thread_np (
-        /* pthread_self () */
-        /* slightly faster than pthread_self(); shaves off a few extra calls
-            EDIT: for various reasons, not using this
-            EDIT2: now we are */
-        _nv_pself
-        /* EDIT2: _pthread_getspecific_direct is an inline function defined in
-         *        a header that is shipped standard-issue, so we're reproducing from
-         *        there.
-         */
-        /* _pthread_getspecific_direct (_PTHREAD_TSD_SLOT_PTHREAD_SELF) */);
-#    else
-    mach_port_name_t _nv_mach_port = pthread_mach_thread_np (
-        pthread_self ());
-#    endif
-
-    thread_identifier_info_data_t _nv_xnu_thrinfo;
-    mach_msg_type_number_t _nv_mach_info_cnt = THREAD_IDENTIFIER_INFO_COUNT;
-    /*
-     * XNU defines thread_info(thread_act_t,
-     *                         thread_flavor_t,
-     *                         thread_info_t,
-     *                         mach_msg_type_number_t)
-     * thread_act_t is a typedef of thread_t
-     * It seems that in kernelspace, thread_t is an alias of `struct thread`
-     * or, in the outer kernel, `mach_port_t`.
-     * However, we have reports that `thread_t` actually aliases `mach_port_name_t`
-     * in proper userland, so that's what we pass in here.
-     */
-    kern_return_t _nv_kern_ret = thread_info (_nv_mach_port,
-                                              THREAD_IDENTIFIER_INFO,
-                                              (thread_info_t)&_nv_xnu_thrinfo,
-                                              &_nv_mach_info_cnt);
-    if (_nv_kern_ret != KERN_SUCCESS) {
-        /* Charlie foxtrot. Die.
-         */
-        __nv_error (NVE_KERN_THREADID_XNU);
+#if defined(NOVA_LAZY_TIDINIT) && !defined(NOVA_TID_RECYCLING)
+    if (__nv_tid_local == 0) {
+        __nv_tid_local = __atomic_add_fetch (&__nv_tid_next, 1, __ATOMIC_ACQ_REL);
     }
-    return _nv_xnu_thrinfo.thread_id;
 #endif
-#if defined(__linux__) || defined(NOVA_FORCE_GETTID)
-    /* should be unique enough for our purposes. i think hope probably yes? */
-    return gettid ();
-#endif
+    return __nv_tid_local;
+}
 
-    /* well, not much we can do at this point.
+typedef struct nv_tid_recycle_info
+{
+    nova_tid_t nv_tid;
+    struct nv_tid_recycle_info * nv_next;
+} nv_tid_recycle_info_t;
+
+typedef struct
+{
+    nv_tid_recycle_info_t * nv_head;
+    nvi_t nv_length;
+} nv_tid_recycle_chain_t;
+
+static nv_tid_recycle_chain_t __nv_tid_recycle_chain = {
+    .nv_head   = NULL,
+    .nv_length = 0
+};
+static nova_mutex_t __nv_tid_recycle_chain_lock;
+
+nova_res_t __nv_tid_recycle_init ()
+{
+    nvmutex_init (&__nv_tid_recycle_chain_lock);
+    return nova_ok;
+}
+
+nova_res_t __nv_tid_recycle_drop ()
+{
+    nvmutex_drop (&__nv_tid_recycle_chain_lock);
+    return nova_ok;
+}
+
+nova_res_t __nv_tid_thread_init ()
+{
+#if !defined(NOVA_LAZY_TIDINIT) && !defined(NOVA_TID_RECYCLING)
+    __nv_tid_local = __atomic_add_fetch (&__nv_tid_next, 1, __ATOMIC_ACQ_REL);
+#elif defined(NOVA_TID_RECYCLING)
+    nv_tid_recycle_info_t * _nv_info = malloc (sizeof *_nv_info);
+    if (_nv_info == NULL) {
+#    if NOVA_MODE_DEBUG
+        __nv_error (NVE_STRUCTALLOC_DRY,
+                    "__nv_tid_init(): (recyclation variation): could not allocate"
+                    " memory for a link in the thread id recycle chain.");
+#    endif
+        return nova_fail;
+    }
+    uint64_t _nv_mark = 1, _nv_gap;
+    nvmutex_lock (&__nv_tid_recycle_chain_lock);
+    nv_tid_recycle_info_t *_nv_curr = __nv_tid_recycle_chain.nv_head,
+                          *_nv_prev = NULL;
+    for (nvi_t i = 0; i < __nv_tid_recycle_chain.nv_length; i++) {
+        _nv_gap = _nv_curr->nv_tid - _nv_mark;
+        if (_nv_gap > 0) {
+            /* @TODO: switch to internal structure allocation API.
+             */
+            _nv_info->nv_tid  = _nv_mark;
+            _nv_info->nv_next = _nv_curr;
+            if (__builtin_expect (_nv_prev != NULL, 1)) {
+                _nv_prev->nv_next = _nv_info;
+            } else {
+                __nv_tid_recycle_chain.nv_head = _nv_info;
+            }
+            __nv_tid_recycle_chain.nv_length++;
+
+            break;
+        }
+        /* Set up for the next iteration of the loop
+         */
+        _nv_mark = _nv_curr->nv_tid + 1;
+        _nv_prev = _nv_curr;
+
+        /* Iterate.
+         */
+        _nv_curr = _nv_curr->nv_next;
+    }
+
+    /* We pull it out of the loop so that we can handle both the 0-length case
+     * and then end-of-chain case.
      */
-    return 0;
-}
+    if (_nv_curr == NULL) {
+        /* So, it's not in any of the gaps (or there are no gaps because the chain
+         * doesn't have any members yet)--that means we just add it to the
+         * end of the chain/start the chain.
+         *
+         * _nv_mark is currently equal to the nv_tid of the previous link + 1, or,
+         * in the case of the start-of-chain scenario, it's 1.
+         */
+        _nv_info->nv_tid = _nv_mark;
+        if (__builtin_expect (_nv_prev != NULL, 1)) {
 
-#if !defined(__APPLE__)
-_Thread_local nova_tid_t nv_tid;
+        } else {
+            __nv_tid_recycle_chain.nv_head = _nv_info;
+        }
 
-nova_res_t nv_tid_init__ ()
-{
-    nv_tid = __nv_tid_impl__ ();
+        __nv_tid_recycle_chain.nv_length++;
+    }
 
-    return nova_ok;
-}
-
-nova_res_t nv_tid_drop__ ()
-{
-    /* Well, not much that we really need to do.
-     * It's POD, so there's no real destruction that needs to occur.
-     */
-    return nova_ok;
-}
-#else
-nova_res_t nv_tid_init__ ()
-{
-    return nova_ok;
-}
-
-nova_res_t nv_tid_drop__ ()
-{
-    return nova_ok;
-}
+    nvmutex_unlock (&__nv_tid_recycle_chain_lock);
 #endif
+
+    return nova_ok;
+}
+
+nova_res_t __nv_tid_thread_drop ()
+{
+#if defined(NOVA_TID_RECYCLING)
+    /* Local cache, hopefully slightly faster than the TLV getters.
+     */
+    nova_tid_t _nv_tid = __nv_tid_local;
+    nvmutex_lock (&__nv_tid_recycle_chain_lock);
+    nv_tid_recycle_info_t *_nv_curr = __nv_tid_recycle_chain.nv_head,
+                          *_nv_prev = NULL;
+    for (nvi_t i = 0; i < __nv_tid_recycle_chain.nv_length; i++) {
+        if (_nv_curr->nv_tid == _nv_tid) {
+            if (__builtin_expect (_nv_prev != NULL, 1)) {
+                _nv_prev->nv_next = _nv_curr->nv_next;
+            } else {
+                __nv_tid_recycle_chain.nv_head = _nv_curr->nv_next;
+            }
+            free (_nv_curr);
+            __nv_tid_recycle_chain.nv_length--;
+            break;
+        }
+        _nv_prev = _nv_curr;
+        _nv_curr = _nv_curr->nv_next;
+    }
+    nvmutex_unlock (&__nv_tid_recycle_chain_lock);
+    if (_nv_curr == NULL) {
+        /* Failed to find the relevant tid/no tids in chain
+         */
+        __nv_error (NVE_BADCALL,
+                    "__nv_tid_drop(): tid was not initialized, or was previously"
+                    " dropped, for this thread {tid=%lu}.",
+                    _nv_tid);
+        return nova_fail;
+    }
+#endif
+    return nova_ok;
+}

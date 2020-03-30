@@ -213,7 +213,7 @@ nova_res_t __nv_block_dealloc (nova_block_t * nv_block, void * nv_obj)
      *
      * Therefore, for the purposes of P1, nv_owner will always be valid.
      */
-    if (__builtin_expect (nv_tid == __atomic_load_n (&nv_block->nv_owner, __ATOMIC_ACQUIRE), 1)) {
+    if (__builtin_expect (__nv_tid () == __atomic_load_n (&nv_block->nv_owner, __ATOMIC_ACQUIRE), 1)) {
         /* Shuffle the object back into the free chain.
          */
 
