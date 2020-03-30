@@ -18,9 +18,9 @@ nova_test: nova_test.c $(LIB) nova.h
 	$(CC) -L. -I. -l$(LIBSHORT) $< -o $@
 
 clean:
-	rm $(OFILES)
+	rm -f $(OFILES)
 
 distclean: clean
-	rm $(LIB)
+	rm -f $(LIB)
 	rm -rf nova_test.dSYM
 	rm -f nova_test
